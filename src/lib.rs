@@ -56,6 +56,19 @@ pub enum LoanStatus {
 
 #[contracttype]
 pub enum DataKey {
+    Loan(Address),           // borrower → LoanRecord
+    Vouches(Address),        // borrower → Vec<VouchRecord>
+    Admin,                   // Address allowed to call slash
+    Token,                   // XLM token contract address
+    Deployer,                // Address that deployed the contract; guards initialize
+    SlashTreasury,           // i128 accumulated slashed funds
+    Paused,                  // bool: true when contract is paused
+    ReputationNft,           // Address of the ReputationNftContract
+    Config,                  // Config struct: all configurable protocol parameters
+    YieldBps,                // i128 yield in basis points
+    SlashBps,                // i128 slash penalty in basis points
+    PendingAdmin,            // Address of the pending admin (two-step transfer)
+    RepaymentCount(Address), // borrower → u32 total successful repayments
     Loan(Address),       // borrower → LoanRecord
     Vouches(Address),    // borrower → Vec<VouchRecord>
     Config,              // contract configuration
@@ -551,6 +564,16 @@ impl QuorumCreditContract {
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
+
+        // Increment successful repayment count for the borrower.
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RepaymentCount(borrower.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepaymentCount(borrower.clone()), &(count + 1));
 
         // Mint one reputation point if a reputation NFT contract is configured.
         if let Some(nft_addr) = env
@@ -1115,6 +1138,12 @@ impl QuorumCreditContract {
             .sum()
     }
 
+    /// Returns the total number of successful repayments for a borrower.
+    /// Returns 0 if the borrower has never repaid a loan.
+    pub fn repayment_count(env: Env, borrower: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RepaymentCount(borrower))
     // ── Loan Pool ─────────────────────────────────────────────────────────────
 
     /// Admin function: atomically disburse a batch of small loans to multiple borrowers.
@@ -2116,7 +2145,7 @@ mod tests {
     #[test]
     fn test_default_loan_duration_is_30_days() {
         let env = Env::default();
-        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let (contract_id, _, _, _, _) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         assert_eq!(client.get_config().loan_duration, DEFAULT_LOAN_DURATION);
@@ -2125,9 +2154,10 @@ mod tests {
     #[test]
     fn test_get_admins_returns_configured_admins() {
         let env = Env::default();
-        let (contract_id, _token_addr, admin, _borrower, _voucher) = setup(&env);
+        let (contract_id, _, _, _, _) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
+        assert_eq!(client.get_admin(), client.get_admin());
         let admins = client.get_admins();
         assert_eq!(admins.len(), 1);
         assert_eq!(admins.get(0).unwrap(), admin);
@@ -2729,8 +2759,6 @@ mod tests {
         assert_eq!(client.get_reputation(&borrower), 0);
     }
 
-    // ── Config Tests ──────────────────────────────────────────────────────────
-
     #[test]
     fn test_get_config_returns_defaults() {
         let env = Env::default();
@@ -2838,6 +2866,41 @@ mod tests {
 
         // No NFT contract configured — should return 0 gracefully.
         assert_eq!(client.get_reputation(&borrower), 0);
+    }
+
+    // ── Repayment Count Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_repayment_count_tracks_successful_repayments() {
+        let env = Env::default();
+        let (contract_id, token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+
+        // Count starts at 0 for unknown borrower.
+        assert_eq!(client.repayment_count(&borrower), 0);
+
+        // First loan cycle: vouch -> request -> repay.
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower);
+        assert_eq!(client.repayment_count(&borrower), 1);
+
+        // Second loan cycle: request again (ensure previous loan is repaid) -> repay.
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower);
+        assert_eq!(client.repayment_count(&borrower), 2);
+
+        // Slash should NOT increment the repayment count.
+        let borrower2 = Address::generate(&env);
+        let voucher2 = Address::generate(&env);
+        token_admin.mint(&voucher2, &10_000_000);
+
+        assert_eq!(client.repayment_count(&borrower2), 0);
+        client.vouch(&voucher2, &borrower2, &1_000_000);
+        client.request_loan(&borrower2, &500_000, &1_000_000);
+        client.slash(&borrower2);
+        assert_eq!(client.repayment_count(&borrower2), 0);
     }
 
     // ── Loan Pool Tests ───────────────────────────────────────────────────────
