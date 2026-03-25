@@ -83,6 +83,7 @@ pub enum DataKey {
     PendingAdmin,            // Address of the pending admin (two-step transfer)
     RepaymentCount(Address), // borrower → u32 total successful repayments
     ProtocolFeeBps,          // u32: protocol fee in basis points
+    FeeTreasury,             // Address: recipient of collected protocol fees
     LastVouchTimestamp(Address), // voucher → u64 last vouch timestamp
 }
 
@@ -549,7 +550,16 @@ impl QuorumCreditContract {
                 .unwrap_or(Vec::new(&env));
 
             let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
-            let total_yield = loan.amount * cfg.yield_bps / 10_000;
+
+            // Deduct protocol fee from the repaid principal before computing yield.
+            let fee_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(0);
+            let protocol_fee = loan.amount * fee_bps as i128 / 10_000;
+            let distributable = loan.amount - protocol_fee;
+            let total_yield = distributable * cfg.yield_bps / 10_000;
 
             // Pre-check contract balance covers all payouts before committing.
             let total_payout: i128 = vouches.iter().map(|v| {
@@ -558,9 +568,20 @@ impl QuorumCreditContract {
             }).sum();
             let contract_balance = token.balance(&env.current_contract_address());
             assert!(
-                contract_balance >= total_payout,
+                contract_balance >= total_payout + protocol_fee,
                 "insufficient contract balance for yield distribution"
             );
+
+            // Send protocol fee to treasury if configured.
+            if protocol_fee > 0 {
+                if let Some(treasury) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Address>(&DataKey::FeeTreasury)
+                {
+                    token.transfer(&env.current_contract_address(), &treasury, &protocol_fee);
+                }
+            }
 
             // Return stake + yield to each voucher.
             for v in vouches.iter() {
@@ -945,6 +966,19 @@ impl QuorumCreditContract {
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0)
+    }
+
+    /// Admin sets the treasury address that receives protocol fees on repayment.
+    pub fn set_fee_treasury(env: Env, admin_signers: Vec<Address>, treasury: Address) {
+        Self::require_admin_approval(&env, &admin_signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeTreasury, &treasury);
+    }
+
+    /// Returns the current fee treasury address, if set.
+    pub fn get_fee_treasury(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::FeeTreasury)
     }
 
     // ── Admin: Upgrade ──────────────────────────────────────────────────────
@@ -2506,6 +2540,66 @@ mod tests {
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         let admin_signers = single_admin_signers(&env, &admin);
         client.set_protocol_fee(&admin_signers, &10_001);
+    }
+
+    #[test]
+    fn test_protocol_fee_deducted_on_repayment_and_sent_to_treasury() {
+        let env = Env::default();
+        let (contract_id, token_addr, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token = TokenClient::new(&env, &token_addr);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        let treasury = Address::generate(&env);
+        // 100 bps = 1% fee
+        client.set_protocol_fee(&admin_signers, &100);
+        client.set_fee_treasury(&admin_signers, &treasury);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        // loan = 500_000; fee = 500_000 * 100 / 10_000 = 5_000
+        // distributable = 495_000; yield = 495_000 * 200 / 10_000 = 9_900
+        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+        client.repay(&borrower, &500_000);
+
+        // treasury receives the protocol fee
+        assert_eq!(token.balance(&treasury), 5_000);
+        // voucher gets stake back + yield on distributable amount
+        // 1_000_000 + 9_900 = 1_009_900; started with 10_000_000 - 1_000_000 = 9_000_000
+        assert_eq!(token.balance(&voucher), 10_009_900);
+    }
+
+    #[test]
+    fn test_protocol_fee_zero_no_treasury_transfer() {
+        let env = Env::default();
+        let (contract_id, token_addr, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token = TokenClient::new(&env, &token_addr);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        let treasury = Address::generate(&env);
+        // fee stays at 0 (default), treasury set but should receive nothing
+        client.set_fee_treasury(&admin_signers, &treasury);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+        client.repay(&borrower, &500_000);
+
+        assert_eq!(token.balance(&treasury), 0);
+        // yield unchanged from no-fee case: 500_000 * 200 / 10_000 = 10_000
+        assert_eq!(token.balance(&voucher), 10_010_000);
+    }
+
+    #[test]
+    fn test_set_and_get_fee_treasury() {
+        let env = Env::default();
+        let (contract_id, _token_addr, admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        assert!(client.get_fee_treasury().is_none());
+        let treasury = Address::generate(&env);
+        client.set_fee_treasury(&admin_signers, &treasury);
+        assert_eq!(client.get_fee_treasury().unwrap(), treasury);
     }
 
     // ── Admin Tests ───────────────────────────────────────────────────────────
