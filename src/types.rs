@@ -92,9 +92,10 @@ pub struct LoanRecord {
     pub total_yield: i128,   // yield owed to vouchers, locked in at disbursement
     pub repaid: bool,
     pub defaulted: bool,
-    pub created_at: u64,             // ledger timestamp
-    pub disbursement_timestamp: u64, // ledger timestamp
-    pub deadline: u64,               // repayment deadline (ledger timestamp)
+    pub created_at: u64,                  // ledger timestamp
+    pub disbursement_timestamp: u64,      // ledger timestamp
+    pub repayment_timestamp: Option<u64>, // set once the loan is fully repaid
+    pub deadline: u64,                    // repayment deadline (ledger timestamp)
 }
 
 #[contracttype]

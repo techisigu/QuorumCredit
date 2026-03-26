@@ -116,6 +116,7 @@ pub fn request_loan(
             defaulted: false,
             created_at: now,
             disbursement_timestamp: now,
+            repayment_timestamp: None,
             deadline,
         },
     );
@@ -206,6 +207,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
         }
 
         loan.repaid = true;
+        loan.repayment_timestamp = Some(env.ledger().timestamp());
         let count: u32 = env
             .storage()
             .persistent()

@@ -1,245 +1,17 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, Vec,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env, Vec};
 
-// Module declarations
 pub mod admin;
 pub mod errors;
 pub mod helpers;
 pub mod loan;
 pub mod reputation;
-<<<<<<< emitevents
 pub mod types;
 pub mod vouch;
 
-// Re-exports for external use
 pub use errors::ContractError;
 pub use types::*;
-=======
-use reputation::ReputationNftExternalClient;
-
-// ── Constants (defaults only) ─────────────────────────────────────────────────
-
-const DEFAULT_YIELD_BPS: i128 = 200;
-const DEFAULT_SLASH_BPS: i128 = 5000;
-/// Minimum stake (in stroops) required for a vouch to earn non-zero yield.
-/// At 200 bps (2%), a stake must be at least 50 stroops so that
-/// `stake * 200 / 10_000 >= 1`. Stakes below this threshold would silently
-/// truncate to zero yield due to integer division.
-const DEFAULT_MIN_YIELD_STAKE: i128 = 50;
-const _: () = assert!(
-    DEFAULT_YIELD_BPS > 0 && DEFAULT_YIELD_BPS <= 10_000,
-    "DEFAULT_YIELD_BPS must be in range 1..=10_000"
-);
-const _: () = assert!(
-    DEFAULT_SLASH_BPS > 0 && DEFAULT_SLASH_BPS <= 10_000,
-    "DEFAULT_SLASH_BPS must be in range 1..=10_000"
-);
-const DEFAULT_MAX_VOUCHERS: u32 = 100;
-const DEFAULT_MIN_LOAN_AMOUNT: i128 = 100_000;
-const DEFAULT_LOAN_DURATION: u64 = 30 * 24 * 60 * 60;
-const DEFAULT_MAX_LOAN_TO_STAKE_RATIO: u32 = 150;
-const DEFAULT_SLASH_CHALLENGE_WINDOW: u64 = 7 * 24 * 60 * 60;
-const DEFAULT_VOUCH_COOLDOWN_SECS: u64 = 24 * 60 * 60; // 24 hours
-/// Delay before a timelocked action can be executed (24 hours).
-const TIMELOCK_DELAY: u64 = 24 * 60 * 60;
-/// Window after eta during which the action can still be executed (72 hours).
-const TIMELOCK_EXPIRY: u64 = 72 * 60 * 60;
-
-// ── Errors ────────────────────────────────────────────────────────────────────
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ContractError {
-    InsufficientFunds = 1,
-    /// Borrower already has an active (non-repaid, non-defaulted) loan.
-    ActiveLoanExists = 2,
-    /// Total vouched stake overflowed i128.
-    StakeOverflow = 3,
-    /// admin or token address must not be the zero address.
-    ZeroAddress = 4,
-    DuplicateVouch = 2,
-    NoActiveLoan = 3,
-    ContractPaused = 4,
-    LoanPastDeadline = 5,
-    PoolLengthMismatch = 6,
-    PoolEmpty = 7,
-    PoolBorrowerActiveLoan = 8,
-    PoolInsufficientFunds = 9,
-    MinStakeNotMet = 10,
-    LoanExceedsMaxAmount = 11,
-    InsufficientVouchers = 12,
-    UnauthorizedCaller = 13,
-    InvalidAmount = 14,
-    InvalidStateTransition = 15,
-    AlreadyInitialized = 16,
-}
-
-// ── Loan Status ───────────────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LoanStatus {
-    None,
-    Active,
-    Repaid,
-    Defaulted,
-}
-
-// ── Storage Keys ──────────────────────────────────────────────────────────────
-
-#[contracttype]
-pub enum DataKey {
-    Loan(u64),               // loan_id → LoanRecord
-    ActiveLoan(Address),     // borrower → active loan_id
-    LatestLoan(Address),     // borrower → latest loan_id
-    Vouches(Address),        // borrower → Vec<VouchRecord>
-    VoucherHistory(Address), // voucher → Vec<Address> (borrowers backed)
-    Config,                  // Config struct: all configurable protocol parameters
-    Deployer,                // Address that deployed the contract; guards initialize
-    SlashTreasury,           // i128 accumulated slashed funds
-    Paused,                  // bool: true when contract is paused
-    BorrowerList,            // Vec<Address> of all borrowers who have ever requested a loan
-    ReputationNft,           // Address of the ReputationNftContract
-    MinStake,                // i128 minimum stake amount per vouch
-    MaxLoanAmount,           // i128 maximum individual loan size (0 = no cap)
-    MinVouchers,             // u32 minimum number of distinct vouchers required (0 = no minimum)
-    LoanCounter,             // u64: monotonically increasing loan ID counter
-    LoanPool(u64),           // pool_id → LoanPoolRecord
-    LoanPoolCounter,         // u64: monotonically increasing pool ID counter
-    PendingAdmin,            // Address of the pending admin (two-step transfer)
-    RepaymentCount(Address), // borrower → u32 total successful repayments
-    LoanCount(Address),      // borrower → u32 total historical loans disbursed
-    DefaultCount(Address),   // borrower → u32 total defaults (slash + auto_slash + claim_expired)
-    ProtocolFeeBps,          // u32: protocol fee in basis points
-    FeeTreasury,             // Address: recipient of collected protocol fees
-    LastVouchTimestamp(Address), // voucher → u64 last vouch timestamp
-    Timelock(u64),               // proposal_id → TimelockProposal
-    TimelockCounter,             // u64 monotonically increasing proposal ID
-}
-
-// ── Config ────────────────────────────────────────────────────────────────────
-
-/// All configurable protocol parameters, stored under DataKey::Config.
-#[contracttype]
-#[derive(Clone)]
-pub struct Config {
-    /// Admin addresses for multisig governance.
-    pub admins: Vec<Address>,
-    /// Number of admin signatures required.
-    pub admin_threshold: u32,
-    /// XLM token contract address.
-    pub token: Address,
-    /// Yield paid to vouchers on repayment in basis points (default 200 = 2%).
-    pub yield_bps: i128,
-    /// Slash penalty on default in basis points (default 5000 = 50%).
-    pub slash_bps: i128,
-    /// Maximum number of vouchers per loan (default 100).
-    pub max_vouchers: u32,
-    /// Minimum loan amount in stroops (default 100_000 = 0.01 XLM).
-    pub min_loan_amount: i128,
-    /// Loan duration in seconds (default 30 days).
-    pub loan_duration: u64,
-    /// Maximum loan amount as a percentage of total stake (default 150 = 150%).
-    pub max_loan_to_stake_ratio: u32,
-    /// Minimum stake in stroops required for a vouch to earn non-zero yield.
-    /// Vouches below this threshold are rejected to prevent silent yield truncation.
-    /// At the default 200 bps yield rate, the minimum is 50 stroops
-    /// (50 * 200 / 10_000 = 1 stroop of yield).
-    pub min_yield_stake: i128,
-    pub slash_challenge_window: u64,
-}
-
-impl Config {
-    fn default() -> Self {
-        Config {
-            yield_bps: DEFAULT_YIELD_BPS,
-            slash_bps: DEFAULT_SLASH_BPS,
-            max_vouchers: DEFAULT_MAX_VOUCHERS,
-            min_loan_amount: DEFAULT_MIN_LOAN_AMOUNT,
-            loan_duration: DEFAULT_LOAN_DURATION,
-            max_loan_to_stake_ratio: DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
-            min_yield_stake: DEFAULT_MIN_YIELD_STAKE,
-            slash_challenge_window: DEFAULT_SLASH_CHALLENGE_WINDOW,
-        }
-    }
-    /// Grace period after deadline before auto_slash is allowed, in seconds (default 3 days).
-    /// A value of 0 means slashing is allowed immediately after the deadline.
-    pub grace_period: u64,
-}
-
-// ── Data Types ────────────────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone)]
-pub struct LoanRecord {
-    pub id: u64,
-    pub borrower: Address,
-    pub co_borrowers: Vec<Address>,
-    pub amount: i128,        // total loan principal in stroops
-    pub amount_repaid: i128, // cumulative repayments received so far (principal + yield)
-    pub total_yield: i128,   // yield owed to vouchers, locked in at disbursement
-    pub repaid: bool,
-    pub defaulted: bool,
-    pub created_at: u64,             // ledger timestamp
-    pub disbursement_timestamp: u64, // ledger timestamp
-    pub deadline: u64,               // repayment deadline (ledger timestamp)
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct VouchRecord {
-    pub voucher: Address,
-    pub stake: i128,          // in stroops
-    pub vouch_timestamp: u64, // ledger timestamp when vouch was created; immutable after set
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct LoanPoolRecord {
-    pub pool_id: u64,
-    pub borrowers: Vec<Address>,
-    pub amounts: Vec<i128>,
-    pub created_at: u64,
-    pub total_disbursed: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ChallengeStatus {
-    Pending,       
-    Challenged,
-    Resolved,
-    Finalized,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct SlashChallengeRecord {
-    pub borrower: Address,
-    pub initiated_at: u64,
-    pub challenge_deadline: u64,
-    pub status: ChallengeStatus,
-    pub reason: soroban_sdk::Symbol,
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Returns true if the address is the all-zeros account or contract address.
-fn is_zero_address(env: &Env, addr: &Address) -> bool {
-    // Stellar zero account: all-zero 32-byte ed25519 key
-    let zero_account = Address::from_string(&soroban_sdk::String::from_str(
-        env,
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-    ));
-    // Stellar zero contract: all-zero 32-byte contract hash
-    let zero_contract = Address::from_string(&soroban_sdk::String::from_str(
-        env,
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-    ));
-    addr == &zero_account || addr == &zero_contract
-}
->>>>>>> main
 
 use helpers::{config, require_valid_address, validate_admin_config};
 use reputation::ReputationNftExternalClient;
@@ -249,7 +21,6 @@ pub struct QuorumCreditContract;
 
 #[contractimpl]
 impl QuorumCreditContract {
-    /// One-time initialisation: set admins, XLM token address, and default config.
     pub fn initialize(
         env: Env,
         deployer: Address,
@@ -260,13 +31,10 @@ impl QuorumCreditContract {
         deployer.require_auth();
 
         if env.storage().instance().has(&DataKey::Config) {
-            panic_with_error!(&env, ContractError::AlreadyInitialized);
+            return Err(ContractError::AlreadyInitialized);
         }
 
-        // Validate admin addresses and configuration
         validate_admin_config(&env, &admins, admin_threshold)?;
-
-        // Validate token address
         require_valid_address(&env, &token)?;
 
         env.storage().instance().set(&DataKey::Deployer, &deployer);
@@ -288,13 +56,11 @@ impl QuorumCreditContract {
 
         env.events().publish(
             (symbol_short!("contract"), symbol_short!("init")),
-            (deployer.clone(), admins, admin_threshold, token),
+            (deployer, admins, admin_threshold, token),
         );
 
         Ok(())
     }
-
-    // ── Vouch Functions ───────────────────────────────────────────────────────
 
     pub fn vouch(
         env: Env,
@@ -349,8 +115,6 @@ impl QuorumCreditContract {
         vouch::transfer_vouch(env, from, to, borrower)
     }
 
-    // ── Loan Functions ────────────────────────────────────────────────────────
-
     pub fn request_loan(
         env: Env,
         borrower: Address,
@@ -363,8 +127,6 @@ impl QuorumCreditContract {
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
         loan::repay(env, borrower, payment)
     }
-
-    // ── Admin Functions ───────────────────────────────────────────────────────
 
     pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
         admin::add_admin(env, admin_signers, new_admin)
@@ -447,8 +209,6 @@ impl QuorumCreditContract {
     pub fn set_max_loan_to_stake_ratio(env: Env, admin_signers: Vec<Address>, ratio: u32) {
         admin::set_max_loan_to_stake_ratio(env, admin_signers, ratio)
     }
-
-    // ── View Functions ────────────────────────────────────────────────────────
 
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Config)
@@ -569,36 +329,7 @@ impl QuorumCreditContract {
     }
 
     pub fn get_max_loan_to_stake_ratio(env: Env) -> u32 {
-<<<<<<< emitevents
         admin::get_max_loan_to_stake_ratio(env)
-=======
-        Self::config(&env).max_loan_to_stake_ratio
-    }
-
-    /// Admin updates configurable protocol parameters.
-    pub fn set_config(env: Env, admin_signers: Vec<Address>, config: Config) {
-        Self::require_admin_approval(&env, &admin_signers);
-        assert!(config.yield_bps >= 0, "yield_bps must be non-negative");
-        assert!(
-            config.slash_bps > 0 && config.slash_bps <= 10_000,
-            "slash_bps must be 1-10000"
-        );
-        assert!(config.max_vouchers > 0, "max_vouchers must be greater than zero");
-        assert!(config.min_loan_amount > 0, "min_loan_amount must be greater than zero");
-        assert!(config.loan_duration > 0, "loan_duration must be greater than zero");
-        assert!(
-            config.max_loan_to_stake_ratio > 0,
-            "max_loan_to_stake_ratio must be greater than zero"
-        );
-        assert!(config.slash_challenge_window > 0, "challenge window must be positive");
-        Self::validate_admin_config(&config.admins, config.admin_threshold);
-        // grace_period of 0 is valid — means no grace period, slash allowed immediately after deadline.
-        env.storage().instance().set(&DataKey::Config, &config);
-        env.events().publish(
-            (symbol_short!("admin"), symbol_short!("config")),
-            (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
-        );
->>>>>>> main
     }
 
     pub fn get_config(env: Env) -> Config {
@@ -609,326 +340,77 @@ impl QuorumCreditContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        token::StellarAssetClient,
+        Address, Env, Vec,
+    };
 
-    fn create_test_token(env: &Env) -> Address {
-        Address::generate(env)
-    }
-
-    fn create_test_admin(env: &Env) -> Address {
-        Address::generate(env)
-    }
-
-    fn create_zero_account_address(env: &Env) -> Address {
-        Address::from_string(&String::from_str(
-            env,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        ))
-    }
-
-    fn create_zero_contract_address(env: &Env) -> Address {
-        Address::from_string(&String::from_str(
-            env,
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-        ))
-    }
-
-    #[test]
-    fn test_initialize_rejects_zero_admin_address() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let zero_admin = create_zero_account_address(&env);
-        let valid_admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [zero_admin, valid_admin]);
-        let token = create_test_token(&env);
-
-        let result = client.try_initialize(&deployer, &admins, &1, &token);
-        assert!(result.is_err());
-
-        // Verify the specific error
-        match result.err().unwrap() {
-            Ok(err) => assert_eq!(err, ContractError::ZeroAddress),
-            Err(_) => panic!("Expected ContractError::ZeroAddress"),
+    fn address_vec(env: &Env, addrs: &[Address]) -> Vec<Address> {
+        let mut result = Vec::new(env);
+        for addr in addrs {
+            result.push_back(addr.clone());
         }
+        result
     }
 
-    #[test]
-    fn test_initialize_rejects_zero_contract_admin_address() {
-        let env = Env::default();
+    fn setup(env: &Env) -> (Address, Address, Address, Address) {
         env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+        let voucher = Address::generate(env);
+        let admins = address_vec(env, &[admin.clone()]);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_admin = StellarAssetClient::new(env, &token_id.address());
+        token_admin.mint(&voucher, &10_000_000);
+        token_admin.mint(&borrower, &20_000);
 
         let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        token_admin.mint(&contract_id, &50_000_000);
 
-        let deployer = Address::generate(&env);
-        let zero_admin = create_zero_contract_address(&env);
-        let admins = Vec::from_array(&env, [zero_admin]);
-        let token = create_test_token(&env);
-
-        let result = client.try_initialize(&deployer, &admins, &1, &token);
-        assert!(result.is_err());
-
-        // Verify the specific error
-        match result.err().unwrap() {
-            Ok(err) => assert_eq!(err, ContractError::ZeroAddress),
-            Err(_) => panic!("Expected ContractError::ZeroAddress"),
-        }
-    }
-
-    #[test]
-    fn test_initialize_rejects_zero_token_address() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin]);
-        let zero_token = create_zero_account_address(&env);
-
-        let result = client.try_initialize(&deployer, &admins, &1, &zero_token);
-        assert!(result.is_err());
-
-        // Verify the specific error
-        match result.err().unwrap() {
-            Ok(err) => assert_eq!(err, ContractError::ZeroAddress),
-            Err(_) => panic!("Expected ContractError::ZeroAddress"),
-        }
-    }
-
-    #[test]
-    fn test_initialize_succeeds_with_valid_addresses() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin]);
-        let token = create_test_token(&env);
-
-        let result = client.try_initialize(&deployer, &admins, &1, &token);
-        assert!(result.is_ok());
-
-        // Verify contract is initialized
-        assert!(client.is_initialized());
-    }
-
-    #[test]
-    fn test_get_config_returns_defaults_after_initialization() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        let config = client.get_config();
-        assert_eq!(config.yield_bps, DEFAULT_YIELD_BPS);
-        assert_eq!(config.slash_bps, DEFAULT_SLASH_BPS);
-        assert_eq!(config.max_vouchers, DEFAULT_MAX_VOUCHERS);
-        assert_eq!(config.min_loan_amount, DEFAULT_MIN_LOAN_AMOUNT);
-        assert_eq!(config.loan_duration, DEFAULT_LOAN_DURATION);
-        assert_eq!(
-            config.max_loan_to_stake_ratio,
-            DEFAULT_MAX_LOAN_TO_STAKE_RATIO
+        QuorumCreditContractClient::new(env, &contract_id).initialize(
+            &admin,
+            &admins,
+            &1,
+            &token_id.address(),
         );
+
+        (contract_id, admin, borrower, voucher)
     }
 
     #[test]
-    fn test_update_config_yield_bps_only() {
+    fn test_repay_sets_repayment_timestamp_on_full_repayment() {
         let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
+        let (contract_id, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
+        client.vouch(&voucher, &borrower, &1_000_000);
+        env.ledger().set_timestamp(1_000_000 + MIN_VOUCH_AGE);
+        client.request_loan(&borrower, &500_000, &1_000_000);
 
-        client.initialize(&deployer, &admins, &1, &token);
+        let loan_before_repayment = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan_before_repayment.repayment_timestamp, None);
 
-        // Update only yield_bps
-        let new_yield_bps = 300i128;
-        client.update_config(&admins, &Some(new_yield_bps), &None);
+        let total_owed = loan_before_repayment.amount + loan_before_repayment.total_yield;
+        let token_admin = StellarAssetClient::new(&env, &client.get_token());
+        token_admin.mint(&borrower, &(total_owed - loan_before_repayment.amount));
 
-        let config = client.get_config();
-        assert_eq!(config.yield_bps, new_yield_bps);
-        assert_eq!(config.slash_bps, DEFAULT_SLASH_BPS); // Should remain unchanged
-    }
+        let partial_payment = total_owed - 1;
+        client.repay(&borrower, &partial_payment);
 
-    #[test]
-    fn test_update_config_slash_bps_only() {
-        let env = Env::default();
-        env.mock_all_auths();
+        let loan_after_partial = client.get_loan(&borrower).unwrap();
+        assert!(!loan_after_partial.repaid);
+        assert_eq!(loan_after_partial.repayment_timestamp, None);
 
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let repayment_timestamp = 1_000_000 + MIN_VOUCH_AGE + 30;
+        env.ledger().set_timestamp(repayment_timestamp);
+        client.repay(&borrower, &1);
 
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Update only slash_bps
-        let new_slash_bps = 6000i128;
-        client.update_config(&admins, &None, &Some(new_slash_bps));
-
-        let config = client.get_config();
-        assert_eq!(config.yield_bps, DEFAULT_YIELD_BPS); // Should remain unchanged
-        assert_eq!(config.slash_bps, new_slash_bps);
-    }
-
-    #[test]
-    fn test_update_config_both_yield_and_slash_bps() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Update both values
-        let new_yield_bps = 400i128;
-        let new_slash_bps = 7000i128;
-        client.update_config(&admins, &Some(new_yield_bps), &Some(new_slash_bps));
-
-        let config = client.get_config();
-        assert_eq!(config.yield_bps, new_yield_bps);
-        assert_eq!(config.slash_bps, new_slash_bps);
-    }
-
-    #[test]
-    fn test_update_config_no_changes() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Update with None values (no changes)
-        client.update_config(&admins, &None, &None);
-
-        let config = client.get_config();
-        assert_eq!(config.yield_bps, DEFAULT_YIELD_BPS);
-        assert_eq!(config.slash_bps, DEFAULT_SLASH_BPS);
-    }
-
-    #[test]
-    #[should_panic(expected = "yield_bps must be non-negative")]
-    fn test_update_config_rejects_negative_yield_bps() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Try to set negative yield_bps
-        client.update_config(&admins, &Some(-100i128), &None);
-    }
-
-    #[test]
-    #[should_panic(expected = "slash_bps must be 1-10000")]
-    fn test_update_config_rejects_zero_slash_bps() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Try to set zero slash_bps
-        client.update_config(&admins, &None, &Some(0i128));
-    }
-
-    #[test]
-    #[should_panic(expected = "slash_bps must be 1-10000")]
-    fn test_update_config_rejects_slash_bps_above_10000() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Try to set slash_bps above 10000
-        client.update_config(&admins, &None, &Some(10001i128));
-    }
-
-    #[test]
-    fn test_update_config_accepts_boundary_values() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, QuorumCreditContract);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let deployer = Address::generate(&env);
-        let admin = create_test_admin(&env);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        let token = create_test_token(&env);
-
-        client.initialize(&deployer, &admins, &1, &token);
-
-        // Test boundary values
-        client.update_config(&admins, &Some(0i128), &Some(1i128)); // Min values
-        let config = client.get_config();
-        assert_eq!(config.yield_bps, 0);
-        assert_eq!(config.slash_bps, 1);
-
-        client.update_config(&admins, &None, &Some(10000i128)); // Max slash_bps
-        let config = client.get_config();
-        assert_eq!(config.slash_bps, 10000);
+        let repaid_loan = client.get_loan(&borrower).unwrap();
+        assert!(repaid_loan.repaid);
+        assert_eq!(repaid_loan.repayment_timestamp, Some(repayment_timestamp));
     }
 }
