@@ -1,5 +1,5 @@
 use crate::errors::ContractError;
-use crate::helpers::{has_active_loan, require_not_paused, require_positive_amount, token};
+use crate::helpers::{has_active_loan, require_allowed_token, require_not_paused, require_positive_amount};
 use crate::types::{DataKey, VouchRecord};
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 
@@ -8,10 +8,11 @@ pub fn vouch(
     voucher: Address,
     borrower: Address,
     stake: i128,
+    token: Address,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
-    do_vouch(&env, voucher, borrower, stake)
+    do_vouch(&env, voucher, borrower, stake, token)
 }
 
 fn do_vouch(
@@ -19,12 +20,16 @@ fn do_vouch(
     voucher: Address,
     borrower: Address,
     stake: i128,
+    token: Address,
 ) -> Result<(), ContractError> {
     // Validate numeric input: stake must be strictly positive.
     require_positive_amount(env, stake)?;
 
     assert!(voucher != borrower, "voucher cannot vouch for self");
     assert!(stake > 0, "stake must be greater than zero");
+
+    // Validate token is allowed.
+    let token_client = require_allowed_token(env, &token)?;
 
     // Sybil resistance: enforce minimum stake per vouch.
     let min_stake: i128 = env
@@ -50,9 +55,9 @@ fn do_vouch(
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(env));
 
-    // Reject duplicate vouch before any state mutation or transfer.
+    // Reject duplicate vouch (same voucher + same token) before any state mutation or transfer.
     for v in vouches.iter() {
-        if v.voucher == voucher {
+        if v.voucher == voucher && v.token == token {
             return Err(ContractError::DuplicateVouch);
         }
     }
@@ -64,8 +69,7 @@ fn do_vouch(
     }
 
     // Transfer stake from voucher into the contract.
-    let token = token(env);
-    token.transfer(&voucher, &env.current_contract_address(), &stake);
+    token_client.transfer(&voucher, &env.current_contract_address(), &stake);
 
     // Track voucher → borrowers history.
     let mut history: Vec<Address> = env
@@ -82,6 +86,7 @@ fn do_vouch(
         voucher: voucher.clone(),
         stake,
         vouch_timestamp: env.ledger().timestamp(),
+        token: token.clone(),
     });
     env.storage()
         .persistent()
@@ -95,7 +100,7 @@ fn do_vouch(
 
     env.events().publish(
         (symbol_short!("vouch"), symbol_short!("added")),
-        (voucher, borrower, stake),
+        (voucher, borrower, stake, token),
     );
 
     Ok(())
@@ -106,6 +111,7 @@ pub fn batch_vouch(
     voucher: Address,
     borrowers: Vec<Address>,
     stakes: Vec<i128>,
+    token: Address,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
@@ -119,7 +125,7 @@ pub fn batch_vouch(
     for i in 0..borrowers.len() {
         let borrower = borrowers.get(i).unwrap();
         let stake = stakes.get(i).unwrap();
-        do_vouch(&env, voucher.clone(), borrower, stake)?;
+        do_vouch(&env, voucher.clone(), borrower, stake, token.clone())?;
     }
 
     Ok(())
@@ -134,7 +140,6 @@ pub fn increase_stake(
     voucher.require_auth();
     require_not_paused(&env)?;
 
-    // Validate numeric input: additional must be strictly positive.
     require_positive_amount(&env, additional)?;
 
     let mut vouches: Vec<VouchRecord> = env
@@ -148,11 +153,13 @@ pub fn increase_stake(
         .position(|v| v.voucher == voucher)
         .expect("vouch not found") as u32;
 
-    let mut vouch = vouches.get(idx).unwrap();
-    token(&env).transfer(&voucher, &env.current_contract_address(), &additional);
+    let mut vouch_rec = vouches.get(idx).unwrap();
+    // Use the token stored on the vouch record.
+    let token_client = require_allowed_token(&env, &vouch_rec.token)?;
+    token_client.transfer(&voucher, &env.current_contract_address(), &additional);
 
-    vouch.stake += additional;
-    vouches.set(idx, vouch);
+    vouch_rec.stake += additional;
+    vouches.set(idx, vouch_rec);
 
     env.storage()
         .persistent()
@@ -184,30 +191,24 @@ pub fn decrease_stake(
         .position(|v| v.voucher == voucher)
         .expect("vouch not found") as u32;
 
-    let mut vouch = vouches.get(idx).unwrap();
-    assert!(
-        amount <= vouch.stake,
-        "decrease amount exceeds staked amount"
-    );
+    let mut vouch_rec = vouches.get(idx).unwrap();
+    assert!(amount <= vouch_rec.stake, "decrease amount exceeds staked amount");
 
-    vouch.stake -= amount;
-    if vouch.stake == 0 {
+    let token_client = require_allowed_token(&env, &vouch_rec.token)?;
+    vouch_rec.stake -= amount;
+    if vouch_rec.stake == 0 {
         vouches.remove(idx);
     } else {
-        vouches.set(idx, vouch);
+        vouches.set(idx, vouch_rec);
     }
 
     if vouches.is_empty() {
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Vouches(borrower));
+        env.storage().persistent().remove(&DataKey::Vouches(borrower));
     } else {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Vouches(borrower), &vouches);
+        env.storage().persistent().set(&DataKey::Vouches(borrower), &vouches);
     }
 
-    token(&env).transfer(&env.current_contract_address(), &voucher, &amount);
+    token_client.transfer(&env.current_contract_address(), &voucher, &amount);
 
     Ok(())
 }
@@ -222,27 +223,26 @@ pub fn withdraw_vouch(env: Env, voucher: Address, borrower: Address) -> Result<(
         .storage()
         .persistent()
         .get(&DataKey::Vouches(borrower.clone()))
-        .ok_or(ContractError::NoActiveLoan)?; // reuse: "no vouch found"
+        .ok_or(ContractError::NoActiveLoan)?;
 
     let idx = vouches
         .iter()
         .position(|v| v.voucher == voucher)
         .ok_or(ContractError::UnauthorizedCaller)? as u32;
 
-    let stake = vouches.get(idx).unwrap().stake;
+    let vouch_rec = vouches.get(idx).unwrap();
+    let stake = vouch_rec.stake;
+    let token_addr = vouch_rec.token.clone();
     vouches.remove(idx);
 
     if vouches.is_empty() {
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Vouches(borrower.clone()));
+        env.storage().persistent().remove(&DataKey::Vouches(borrower.clone()));
     } else {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Vouches(borrower.clone()), &vouches);
+        env.storage().persistent().set(&DataKey::Vouches(borrower.clone()), &vouches);
     }
 
-    token(&env).transfer(&env.current_contract_address(), &voucher, &stake);
+    let token_client = require_allowed_token(&env, &token_addr)?;
+    token_client.transfer(&env.current_contract_address(), &voucher, &stake);
 
     env.events().publish(
         (symbol_short!("vouch"), symbol_short!("withdrawn")),
@@ -409,12 +409,14 @@ mod tests {
             voucher: voucher1,
             stake: i128::MAX - 1000,
             vouch_timestamp: 0,
+            token: token.clone(),
         });
 
         vouches.push_back(VouchRecord {
             voucher: voucher2,
             stake: 2000, // This would cause overflow when added to the first stake
             vouch_timestamp: 0,
+            token: token.clone(),
         });
 
         // Store the vouches directly in contract storage
@@ -456,12 +458,14 @@ mod tests {
             voucher: voucher1,
             stake: 1_000_000,
             vouch_timestamp: 0,
+            token: token.clone(),
         });
 
         vouches.push_back(VouchRecord {
             voucher: voucher2,
             stake: 2_500_000,
             vouch_timestamp: 0,
+            token: token.clone(),
         });
 
         // Store the vouches directly in contract storage

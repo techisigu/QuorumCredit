@@ -4,11 +4,21 @@ use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env, Ve
 
 pub mod admin;
 pub mod errors;
+pub mod governance;
 pub mod helpers;
 pub mod loan;
 pub mod reputation;
 pub mod types;
 pub mod vouch;
+
+#[cfg(test)]
+mod governance_test;
+#[cfg(test)]
+mod loan_purpose_test;
+#[cfg(test)]
+mod multi_asset_test;
+#[cfg(test)]
+mod referral_test;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -46,6 +56,7 @@ impl QuorumCreditContract {
                 admins: admins.clone(),
                 admin_threshold,
                 token: token.clone(),
+                allowed_tokens: Vec::new(&env),
                 yield_bps: DEFAULT_YIELD_BPS,
                 slash_bps: DEFAULT_SLASH_BPS,
                 max_vouchers: DEFAULT_MAX_VOUCHERS,
@@ -69,8 +80,9 @@ impl QuorumCreditContract {
         voucher: Address,
         borrower: Address,
         stake: i128,
+        token: Address,
     ) -> Result<(), ContractError> {
-        vouch::vouch(env, voucher, borrower, stake)
+        vouch::vouch(env, voucher, borrower, stake, token)
     }
 
     pub fn batch_vouch(
@@ -78,8 +90,9 @@ impl QuorumCreditContract {
         voucher: Address,
         borrowers: Vec<Address>,
         stakes: Vec<i128>,
+        token: Address,
     ) -> Result<(), ContractError> {
-        vouch::batch_vouch(env, voucher, borrowers, stakes)
+        vouch::batch_vouch(env, voucher, borrowers, stakes, token)
     }
 
     pub fn increase_stake(
@@ -117,13 +130,42 @@ impl QuorumCreditContract {
         vouch::transfer_vouch(env, from, to, borrower)
     }
 
+    pub fn register_referral(
+        env: Env,
+        borrower: Address,
+        referrer: Address,
+    ) -> Result<(), ContractError> {
+        loan::register_referral(env, borrower, referrer)
+    }
+
+    pub fn get_referrer(env: Env, borrower: Address) -> Option<Address> {
+        loan::get_referrer(env, borrower)
+    }
+
+    pub fn set_referral_bonus_bps(env: Env, admin_signers: Vec<Address>, bonus_bps: u32) {
+        helpers::require_admin_approval(&env, &admin_signers);
+        assert!(bonus_bps <= 10_000, "bonus_bps must not exceed 10000");
+        env.storage()
+            .instance()
+            .set(&DataKey::ReferralBonusBps, &bonus_bps);
+    }
+
+    pub fn get_referral_bonus_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReferralBonusBps)
+            .unwrap_or(crate::types::DEFAULT_REFERRAL_BONUS_BPS)
+    }
+
     pub fn request_loan(
         env: Env,
         borrower: Address,
         amount: i128,
         threshold: i128,
+        loan_purpose: soroban_sdk::String,
+        token: Address,
     ) -> Result<(), ContractError> {
-        loan::request_loan(env, borrower, amount, threshold)
+        loan::request_loan(env, borrower, amount, threshold, loan_purpose, token)
     }
 
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
@@ -336,5 +378,35 @@ impl QuorumCreditContract {
 
     pub fn get_config(env: Env) -> Config {
         admin::get_config(env)
+    }
+
+    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+        admin::add_allowed_token(env, admin_signers, token)
+    }
+
+    pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+        admin::remove_allowed_token(env, admin_signers, token)
+    }
+
+    pub fn vote_slash(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        approve: bool,
+    ) -> Result<(), ContractError> {
+        governance::vote_slash(env, voucher, borrower, approve)
+    }
+
+    pub fn get_slash_vote(env: Env, borrower: Address) -> Option<SlashVoteRecord> {
+        governance::get_slash_vote(env, borrower)
+    }
+
+    pub fn set_slash_vote_quorum(env: Env, admin_signers: Vec<Address>, quorum_bps: u32) {
+        helpers::require_admin_approval(&env, &admin_signers);
+        governance::set_slash_vote_quorum(&env, quorum_bps);
+    }
+
+    pub fn get_slash_vote_quorum(env: Env) -> u32 {
+        governance::get_slash_vote_quorum(env)
     }
 }

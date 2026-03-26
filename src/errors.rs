@@ -37,4 +37,7 @@ pub enum ContractError {
     VoucherNotFound = 29,
     /// Token address does not implement the SEP-41 token interface.
     InvalidToken = 30,
+    AlreadyVoted = 31,
+    SlashVoteNotFound = 32,
+    SlashAlreadyExecuted = 33,
 }

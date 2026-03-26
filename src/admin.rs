@@ -335,6 +335,29 @@ pub fn get_config(env: Env) -> Config {
     config(&env)
 }
 
+pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+    require_admin_approval(&env, &admin_signers);
+    let mut cfg = config(&env);
+    assert!(
+        !cfg.allowed_tokens.iter().any(|t| t == token) && token != cfg.token,
+        "token already allowed"
+    );
+    cfg.allowed_tokens.push_back(token);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+}
+
+pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+    require_admin_approval(&env, &admin_signers);
+    let mut cfg = config(&env);
+    let idx = cfg
+        .allowed_tokens
+        .iter()
+        .position(|t| t == token)
+        .expect("token not in allowed list") as u32;
+    cfg.allowed_tokens.remove(idx);
+    env.storage().instance().set(&DataKey::Config, &cfg);
+}
+
 pub fn get_admins(env: Env) -> Vec<Address> {
     config(&env).admins
 }

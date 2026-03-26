@@ -104,6 +104,20 @@ pub fn token_client(env: &Env) -> token::Client<'_> {
     token(env)
 }
 
+/// Returns a token client for `addr` after verifying it is an allowed token
+/// (either the primary protocol token or in `Config.allowed_tokens`).
+pub fn require_allowed_token<'a>(
+    env: &'a Env,
+    addr: &Address,
+) -> Result<token::Client<'a>, ContractError> {
+    let cfg = config(env);
+    if *addr == cfg.token || cfg.allowed_tokens.iter().any(|t| t == *addr) {
+        Ok(token::Client::new(env, addr))
+    } else {
+        Err(ContractError::InvalidToken)
+    }
+}
+
 pub fn require_admin_approval(env: &Env, admin_signers: &Vec<Address>) {
     let config = config(env);
     assert!(

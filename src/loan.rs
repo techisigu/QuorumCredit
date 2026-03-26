@@ -1,16 +1,53 @@
 use crate::errors::ContractError;
 use crate::helpers::{
-    config, get_active_loan_record, has_active_loan, next_loan_id, require_not_paused, token,
+    config, get_active_loan_record, has_active_loan, next_loan_id, require_allowed_token,
+    require_not_paused,
 };
 use crate::reputation::ReputationNftExternalClient;
-use crate::types::{DataKey, LoanRecord, LoanStatus, VouchRecord, MIN_VOUCH_AGE};
+use crate::types::{DataKey, LoanRecord, LoanStatus, VouchRecord, DEFAULT_REFERRAL_BONUS_BPS, MIN_VOUCH_AGE};
 use soroban_sdk::{symbol_short, Address, Env, Vec};
+
+/// Register a referrer for a borrower. Must be called before `request_loan`.
+/// The referrer cannot be the borrower themselves.
+pub fn register_referral(
+    env: Env,
+    borrower: Address,
+    referrer: Address,
+) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    assert!(borrower != referrer, "borrower cannot refer themselves");
+    assert!(
+        !has_active_loan(&env, &borrower),
+        "cannot set referral with active loan"
+    );
+    // Idempotent: overwrite is fine (borrower signs).
+    env.storage()
+        .persistent()
+        .set(&DataKey::ReferredBy(borrower.clone()), &referrer);
+
+    env.events().publish(
+        (symbol_short!("referral"), symbol_short!("set")),
+        (borrower, referrer),
+    );
+
+    Ok(())
+}
+
+pub fn get_referrer(env: Env, borrower: Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReferredBy(borrower))
+}
 
 pub fn request_loan(
     env: Env,
     borrower: Address,
     amount: i128,
     threshold: i128,
+    loan_purpose: soroban_sdk::String,
+    token_addr: Address,
 ) -> Result<(), ContractError> {
     borrower.require_auth();
     require_not_paused(&env)?;
@@ -24,16 +61,17 @@ pub fn request_loan(
         return Err(ContractError::Blacklisted);
     }
 
+    // Validate token is allowed before any other checks.
+    let token_client = require_allowed_token(&env, &token_addr)?;
+
     let cfg = config(&env);
 
     assert!(
         amount >= cfg.min_loan_amount,
         "loan amount must meet minimum threshold"
     );
-    // Validate threshold is strictly positive.
     assert!(threshold > 0, "threshold must be greater than zero");
 
-    // Enforce max loan amount cap if configured.
     let max_loan_amount: i128 = env
         .storage()
         .instance()
@@ -43,7 +81,6 @@ pub fn request_loan(
         return Err(ContractError::LoanExceedsMaxAmount);
     }
 
-    // Prevent overwriting an active loan record.
     assert!(
         !has_active_loan(&env, &borrower),
         "borrower already has an active loan"
@@ -55,52 +92,51 @@ pub fn request_loan(
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(&env));
 
-    let mut total_stake: i128 = 0;
+    // Only count vouches denominated in the requested token.
+    let mut token_vouches: Vec<VouchRecord> = Vec::new(&env);
     for v in vouches.iter() {
+        if v.token == token_addr {
+            token_vouches.push_back(v);
+        }
+    }
+
+    let mut total_stake: i128 = 0;
+    for v in token_vouches.iter() {
         total_stake = total_stake
             .checked_add(v.stake)
             .ok_or(ContractError::StakeOverflow)?;
     }
     assert!(total_stake >= threshold, "insufficient trust stake");
 
-    // Enforce minimum voucher count if configured.
     let min_vouchers: u32 = env
         .storage()
         .instance()
         .get(&DataKey::MinVouchers)
         .unwrap_or(0);
-    if vouches.len() < min_vouchers {
+    if token_vouches.len() < min_vouchers {
         return Err(ContractError::InsufficientVouchers);
     }
 
-    // Enforce minimum vouch age: every vouch must be at least MIN_VOUCH_AGE seconds old.
-    // This prevents a same-transaction (or same-block) vouch → request_loan attack.
     let now = env.ledger().timestamp();
-    for v in vouches.iter() {
+    for v in token_vouches.iter() {
         if now < v.vouch_timestamp + MIN_VOUCH_AGE {
             return Err(ContractError::VouchTooRecent);
         }
     }
 
-    // Check collateral ratio: amount must not exceed total_stake * ratio / 100
     let max_allowed_loan = total_stake * cfg.max_loan_to_stake_ratio as i128 / 100;
     assert!(
         amount <= max_allowed_loan,
         "loan amount exceeds maximum collateral ratio"
     );
 
-    // Verify the contract holds enough XLM to cover the loan.
-    let token = token(&env);
-    let contract_balance = token.balance(&env.current_contract_address());
+    let contract_balance = token_client.balance(&env.current_contract_address());
     if contract_balance < amount {
         return Err(ContractError::InsufficientFunds);
     }
 
     let deadline = now + cfg.loan_duration;
     let loan_id = next_loan_id(&env);
-
-    // Lock in the yield at disbursement time so rate changes mid-loan don't
-    // affect what the borrower owes or what vouchers receive (fixes issue #15).
     let total_yield = amount * cfg.yield_bps / 10_000;
 
     env.storage().persistent().set(
@@ -118,6 +154,8 @@ pub fn request_loan(
             disbursement_timestamp: now,
             repayment_timestamp: None,
             deadline,
+            loan_purpose,
+            token_address: token_addr.clone(),
         },
     );
     env.storage()
@@ -127,7 +165,6 @@ pub fn request_loan(
         .persistent()
         .set(&DataKey::LatestLoan(borrower.clone()), &loan_id);
 
-    // Track total historical loan count for this borrower.
     let count: u32 = env
         .storage()
         .persistent()
@@ -137,11 +174,11 @@ pub fn request_loan(
         .persistent()
         .set(&DataKey::LoanCount(borrower.clone()), &(count + 1));
 
-    token.transfer(&env.current_contract_address(), &borrower, &amount);
+    token_client.transfer(&env.current_contract_address(), &borrower, &amount);
 
     env.events().publish(
         (symbol_short!("loan"), symbol_short!("disbursed")),
-        (borrower.clone(), amount, deadline),
+        (borrower.clone(), amount, deadline, token_addr),
     );
 
     Ok(())
@@ -179,7 +216,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
         "invalid payment amount"
     );
 
-    let token = token(&env);
+    let token = soroban_sdk::token::Client::new(&env, &loan.token_address);
 
     token.transfer(&borrower, &env.current_contract_address(), &payment);
     loan.amount_repaid += payment;
@@ -191,15 +228,25 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             .persistent()
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
-        let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
+        // Only distribute yield to vouches in the same token as the loan.
+        let loan_token = soroban_sdk::token::Client::new(&env, &loan.token_address);
+        let mut total_stake: i128 = 0;
+        for v in vouches.iter() {
+            if v.token == loan.token_address {
+                total_stake += v.stake;
+            }
+        }
 
         for v in vouches.iter() {
+            if v.token != loan.token_address {
+                continue;
+            }
             let voucher_yield = if total_stake > 0 {
                 loan.total_yield * v.stake / total_stake
             } else {
                 0
             };
-            token.transfer(
+            loan_token.transfer(
                 &env.current_contract_address(),
                 &v.voucher,
                 &(v.stake + voucher_yield),
@@ -208,6 +255,28 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
 
         loan.repaid = true;
         loan.repayment_timestamp = Some(env.ledger().timestamp());
+
+        // Pay referral bonus if a referrer is registered.
+        if let Some(referrer) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::ReferredBy(borrower.clone()))
+        {
+            let bonus_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ReferralBonusBps)
+                .unwrap_or(DEFAULT_REFERRAL_BONUS_BPS);
+            let bonus = loan.amount * bonus_bps as i128 / 10_000;
+            if bonus > 0 {
+                loan_token.transfer(&env.current_contract_address(), &referrer, &bonus);
+                env.events().publish(
+                    (symbol_short!("referral"), symbol_short!("bonus")),
+                    (referrer, borrower.clone(), bonus),
+                );
+            }
+        }
+
         let count: u32 = env
             .storage()
             .persistent()

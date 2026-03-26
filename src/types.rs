@@ -7,6 +7,7 @@ use soroban_sdk::{contracttype, Address, Vec};
 pub const DEFAULT_YIELD_BPS: i128 = 200;
 pub const DEFAULT_SLASH_BPS: i128 = 5000;
 pub const DEFAULT_MIN_YIELD_STAKE: i128 = 50;
+pub const DEFAULT_REFERRAL_BONUS_BPS: u32 = 100; // 1% of loan amount
 pub const MIN_VOUCH_AGE: u64 = 60; // 1 minute
 pub const DEFAULT_MAX_VOUCHERS: u32 = 100;
 pub const DEFAULT_MIN_LOAN_AMOUNT: i128 = 100_000;
@@ -60,6 +61,21 @@ pub enum DataKey {
     Blacklisted(Address), // borrower → bool permanently banned
     VoucherWhitelist(Address), // voucher → bool allowed to vouch
     ExtensionConsents(Address), // borrower → Vec<Address> vouchers who consented to extension
+    SlashVote(Address),         // borrower → SlashVoteRecord
+    SlashVoteQuorum,            // u32 quorum in basis points (e.g. 5000 = 50%)
+    ReferredBy(Address),        // borrower → Address of referrer
+    ReferralBonusBps,           // u32 referral bonus in basis points (default 100 = 1%)
+}
+
+// ── Governance ────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashVoteRecord {
+    pub approve_stake: i128,    // total stake voting to approve slash
+    pub reject_stake: i128,     // total stake voting to reject slash
+    pub voters: Vec<Address>,   // addresses that have already voted
+    pub executed: bool,         // true once slash has been auto-executed
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -70,6 +86,7 @@ pub struct Config {
     pub admins: Vec<Address>,
     pub admin_threshold: u32,
     pub token: Address,
+    pub allowed_tokens: Vec<Address>, // additional tokens accepted for loans/vouches
     pub yield_bps: i128,
     pub slash_bps: i128,
     pub max_vouchers: u32,
@@ -96,6 +113,8 @@ pub struct LoanRecord {
     pub disbursement_timestamp: u64,      // ledger timestamp
     pub repayment_timestamp: Option<u64>, // set once the loan is fully repaid
     pub deadline: u64,                    // repayment deadline (ledger timestamp)
+    pub loan_purpose: soroban_sdk::String, // borrower-supplied purpose string
+    pub token_address: Address,           // token used for this loan
 }
 
 #[contracttype]
@@ -104,6 +123,7 @@ pub struct VouchRecord {
     pub voucher: Address,
     pub stake: i128,          // in stroops
     pub vouch_timestamp: u64, // ledger timestamp when vouch was created; immutable after set
+    pub token: Address,       // token this stake is denominated in
 }
 
 #[contracttype]
